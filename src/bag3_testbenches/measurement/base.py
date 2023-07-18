@@ -275,7 +275,8 @@ class GenericTB(TestbenchManager, abc.ABC):
             elif dev_type != 'mind':
                 # mind (mutual inductor) has no terminals, so "pin" or "conns" are not needed.
                 raise ValueError('Specify either "pin" or "conns".')
-            value: Union[float, str] = params['value']
+            # some elements like ideal_balun don't need a value
+            value: Optional[Union[float, str, Mapping[str, Any]]] = params.get('value', {})
             name: Optional[str] = params.get('name')
             if 'nin' in params:
                 if not pin:
