@@ -31,7 +31,7 @@
 """This module defines an optimization-based design flow inspired by Eric Chang's VLSI 2018 talk."""
 
 from __future__ import annotations
-from typing import Optional, Dict, Any, Tuple, List, Iterable, Mapping, Union, Callable, Type
+from typing import Optional, Dict, Any, Tuple, List, Iterable, Mapping, Union, Callable, Type, Sequence
 
 import abc
 import itertools
@@ -45,6 +45,7 @@ import numpy as np
 from pybag.enum import LogLevel
 
 from bag.concurrent.util import GatherHelper
+from bag.concurrent.core import batch_async_task
 from bag.io.file import read_yaml
 from bag.io.sim_data import save_sim_results, load_sim_file, SweepArray
 from bag.math import float_to_si_string, si_string_to_float
@@ -227,6 +228,8 @@ class OptDesigner(DesignerBase, abc.ABC):
         self._swp_params = None
         self._swp_shape = None
         self._em_sim = None
+        self._rcx_params = None
+        self._harnesses = []
         super().__init__(root_dir, sim_db, dsn_specs)
 
     @classmethod
@@ -282,6 +285,44 @@ class OptDesigner(DesignerBase, abc.ABC):
         )
 
         self._swp_shape = tuple(len(self._swp_params[var]) for var in self._swp_order)
+
+        self._rcx_params = self.dsn_specs.get('rcx_params')
+
+        # harnesses
+        harness_specs_list: Sequence[Mapping[str, Any]] = self.dsn_specs.get('harness_specs_list', [])
+        specs_list = []
+        for _specs in harness_specs_list:
+            _extract: bool = _specs.get('extract', self._sim_db.extract)
+            _gen_specs_file: str = _specs.get('gen_specs_file', '')
+            if _gen_specs_file:
+                _gen_specs: Mapping[str, Any] = read_yaml(_gen_specs_file)
+                _params_key = 'params'
+            else:
+                _gen_specs = _specs
+                _params_key = 'dut_params'
+            _static_info: str = _specs.get('static_info', '')
+            if _static_info:
+                _use_netlist: Optional[str] = _specs.get('use_netlist')
+                if _use_netlist is None and not _extract:
+                    print('Since harness is static, and a schematic or extracted netlist is not provided, '
+                          'the harness will be extracted from the Virtuoso library.')
+                specs_list.append(dict(
+                    static_info=_static_info,
+                    use_netlist=_use_netlist,
+                    extract=_use_netlist is None,
+                ))
+            else:
+                specs_list.append(dict(
+                    impl_cell=_gen_specs['impl_cell'],
+                    dut_cls=_gen_specs.get('dut_class') or _gen_specs['lay_class'],
+                    dut_params=_gen_specs[_params_key],
+                    extract=_extract,
+                    export_lay=self._sim_db.gen_sch_dut & _extract,
+                    name_prefix=_gen_specs.get('name_prefix', ''),
+                    name_suffix=_gen_specs.get('name_suffix', ''),
+                ))
+        coro = self.async_batch_dut(specs_list, self._rcx_params)
+        self._harnesses = batch_async_task([coro])[0]
 
     @property
     def is_lay(self) -> bool:
@@ -393,7 +434,7 @@ class OptDesigner(DesignerBase, abc.ABC):
             sim_dir = Path(sim_dir)
         if sim_dir.is_absolute():
             try:
-                out_dir = sim_dir.relative_to(sim_db._sim._dir_path)
+                out_dir = sim_dir.relative_to(sim_db.sim_dir_path)
             except ValueError:
                 return sim_dir
             else:
@@ -488,6 +529,7 @@ class OptDesigner(DesignerBase, abc.ABC):
         """
         return base_gen_specs
 
+    # noinspection PyMethodMayBeStatic
     def process_meas_results(self, res: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         """Processes and returns measurement results.
         If any particular post-processing needs to be done, this method should be overriden by subclasses.
@@ -509,7 +551,8 @@ class OptDesigner(DesignerBase, abc.ABC):
 
     @abc.abstractmethod
     async def verify_design(self, dut: DesignInstance, dsn_params: Dict[str, Any],
-                            sim_swp_params: Dict[str, np.ndarray]) -> Dict[str, Any]:
+                            sim_swp_params: Dict[str, np.ndarray], harnesses: Optional[Sequence[DesignInstance]] = None
+                            ) -> Dict[str, Any]:
         """Simulates and verifies design. This method is to be implemented by subclasses.
 
         Parameters
@@ -522,6 +565,9 @@ class OptDesigner(DesignerBase, abc.ABC):
 
         sim_swp_params : Dict[str, np.ndarray]
             Simulation sweep parameters.
+
+        harnesses : Optional[Sequence[DesignInstance]]
+            The harnesses
 
         Returns
         -------
@@ -664,7 +710,7 @@ class OptDesigner(DesignerBase, abc.ABC):
             dut_gen_params = self.get_dut_gen_specs(self._is_lay, self.base_gen_specs,
                                                     {**self.dsn_fixed_params, **dsn_params})
             ext_dut_name = f'{dsn_name}_ext' if self._em_sim else dsn_name
-            dut = await self.async_new_dut(ext_dut_name, self.dut_class, dut_gen_params,
+            dut = await self.async_new_dut(ext_dut_name, self.dut_class, dut_gen_params, rcx_params=self._rcx_params,
                                            export_lay=self._sim_db.extract and self._sim_db.gen_sch_dut)
             if self._em_sim:
                 em_dut_gen_params = self.get_em_dut_gen_specs(self.base_gen_specs,
@@ -675,12 +721,13 @@ class OptDesigner(DesignerBase, abc.ABC):
                                                      gds_file.parent)
                 dsn_params['sp_file'] = sp_file
 
-            res = await self.verify_design(dut, dsn_params, self.sim_swp_params)
+            res = await self.verify_design(dut, dsn_params, self.sim_swp_params, self._harnesses)
 
         self.save_results(res, dsn_params)
 
         return res
 
+    # noinspection PyMethodMayBeStatic
     async def pre_setup(self, dsn_params: Dict[str, Any]) -> Dict[str, Any]:
         """Processes and returns design parameters.
         If any particular pre-processing needs to be done, this method should be overridden by subclasses.
@@ -713,7 +760,7 @@ class OptDesigner(DesignerBase, abc.ABC):
         run_meas : bool
             True to run measurement, False if not.
         """
-        if self._sim_db._force_sim:  # force_sim is enabled, so always rerun
+        if self._sim_db.force_sim:  # force_sim is enabled, so always rerun
             return True
         if not res_fpath.exists():  # cannot find previous results
             return True
