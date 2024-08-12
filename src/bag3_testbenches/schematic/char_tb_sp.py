@@ -30,7 +30,7 @@
 
 # -*- coding: utf-8 -*-
 
-from typing import Mapping, Any, Optional
+from typing import Mapping, Any, Optional, Sequence
 
 import pkg_resources
 from pathlib import Path
@@ -67,6 +67,7 @@ class bag3_testbenches__char_tb_sp(Module):
             extracted='True to run extracted measurements',
             dut_lib='DUT library name',
             dut_cell='DUT cell name',
+            dut_pins='DUT pin names',
             dut_plus='Plus connection for DUT',
             dut_minus='Minus connection for DUT',
             dut_vdd='VDD connection for DUT, optional',
@@ -77,10 +78,12 @@ class bag3_testbenches__char_tb_sp(Module):
 
     @classmethod
     def get_default_param_values(cls) -> Mapping[str, Any]:
-        return dict(dut_lib='', dut_cell='', dut_vdd='VDD', dut_vss='VSS', extracted=True, ind_specs=None)
+        return dict(dut_lib='', dut_cell='', dut_pins=None, dut_vdd='VDD', dut_vss='VSS', extracted=True,
+                    ind_specs=None)
 
     def design(self, extracted: bool, dut_lib: str, dut_cell: str, dut_plus: str, dut_minus: str, dut_vdd: str,
-               dut_vss: str, passive_type: str, ind_specs: Optional[Mapping[str, Any]]) -> None:
+               dut_vss: str, passive_type: str, ind_specs: Optional[Mapping[str, Any]],
+               dut_pins: Optional[Sequence[str]]) -> None:
         """To be overridden by subclasses to design this module.
 
         This method should fill in values for all parameters in
@@ -96,6 +99,11 @@ class bag3_testbenches__char_tb_sp(Module):
         restore_instance()
         array_instance()
         """
+        dut_conns = []
+        if dut_cell:
+            # handle dut pins
+            dut_conns = [(_term, _term) for _term in dut_pins]
+
         if extracted:
             self.remove_instance('Cc')
             self.remove_instance('Cpp')
@@ -103,6 +111,7 @@ class bag3_testbenches__char_tb_sp(Module):
             self.replace_instance_master('XDUT', dut_lib, dut_cell, keep_connections=True, static=True)
             self.reconnect_instance('XDUT', [(dut_vdd, 'VDD'), (dut_vss, 'VSS'),
                                              (dut_plus, 'plus'), (dut_minus, 'minus')])
+            # TODO: handle dut_conns
         else:
             if passive_type == 'cap':
                 self.remove_instance('XDUT')
