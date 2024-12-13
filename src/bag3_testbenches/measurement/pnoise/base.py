@@ -29,7 +29,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-from typing import Any, Optional, Mapping, List, Union, Tuple
+from typing import Any, Optional, Mapping, List, Union, Tuple, Sequence
 
 from bag.simulation.data import SimNetlistInfo, netlist_info_from_dict
 
@@ -38,6 +38,12 @@ from ..pss.base import PSSTB
 
 class PNoiseTB(PSSTB):
     """This class provide utility methods useful for all PNoise simulations.
+
+    Use `sweep_options` to set the noise frequency sweep.
+    Use `probe_info_list` to set one or more pnoise runs with the respective terminals and options.
+    For sampled jitter, include the keyword `measurements` in `pnoise_options`. This must contain a
+        list of dictionaries that will be parsed as `JitterEvent` objects. See `bag.simulation.data`
+        for more details.
 
     Notes
     -----
@@ -56,7 +62,9 @@ class PNoiseTB(PSSTB):
     probe_info_list : List[Tuple]
         A list of pnoise measurement info (p_port, n_port, pnoise options).
     pnoise_options : Optional[Mapping[str, Any]]
-        Optional.  PNoise simulation options dictionary. (spectre -h pnoise to see available parameters)
+        Optional.  PNoise simulation options dictionary. Run `spectre -h pnoise` to see available parameters.
+        If the key `measurement` is included, the contents will be parsed as `JitterEvent`s. See 
+            `bag.simulation.data` for details.
     """
 
     def get_netlist_info(self) -> SimNetlistInfo:
@@ -66,7 +74,7 @@ class PNoiseTB(PSSTB):
         if len(probe_info_list) == 0:
             raise ValueError("At least one probe must be specified")
         pnoise_options: Mapping[str, Any] = self.specs.get('pnoise_options', {})
-        measurement = pnoise_options.pop('measurement', None)
+        measurement: Optional[Sequence[Mapping[str, Any]] = pnoise_options.pop('measurement', None)
         pnoise_dict_list = []
         for probe_info in probe_info_list:
             if len(probe_info) == 2:
