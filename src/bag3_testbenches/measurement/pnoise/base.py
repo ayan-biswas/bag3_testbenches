@@ -66,6 +66,7 @@ class PNoiseTB(PSSTB):
         if len(probe_info_list) == 0:
             raise ValueError("At least one probe must be specified")
         pnoise_options: Mapping[str, Any] = self.specs.get('pnoise_options', {})
+        measurement = pnoise_options.pop('measurement', None)
         pnoise_dict_list = []
         for probe_info in probe_info_list:
             if len(probe_info) == 2:
@@ -80,6 +81,7 @@ class PNoiseTB(PSSTB):
                 save_outputs=self.save_outputs,
                 p_port=p_port,
                 n_port=n_port,
+                measurement=measurement,
                 options={**pnoise_options, **addl_pnoise_options},
             ))
         sim_setup['analyses'].extend(pnoise_dict_list)

@@ -125,6 +125,7 @@ class CharSPMeas(MeasurementManager):
 
         tb_params = dict(
             extracted=self.specs['tbm_specs'].get('extracted', True),
+            dut_pins=dut.pin_names,
             dut_plus=dut_plus,
             dut_minus=dut_minus,
             dut_vdd=self.specs['tbm_specs'].get('dut_vdd', 'VDD'),

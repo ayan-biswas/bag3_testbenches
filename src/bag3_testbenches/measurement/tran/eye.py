@@ -43,17 +43,18 @@ class EyeResults:
             plt.legend(loc='upper right')
             plt.show()
     
-    def savefig(self, fname: str) -> None:
+    def savefig(self, fname: str, title: str) -> None:
         plt.figure()
         plt.plot(self.time_eye, self.eye_vals.T, 'b')
         plt.hlines(self.val_mid, self.time_eye[self.pos_w0], self.time_eye[self.pos_w1],
-                   label=f'width={self.width} s', linestyle="--", colors=['r'])
+                   label=f'width={self.width:0.3g} s', linestyle="--", colors=['r'])
         plt.vlines(self.time_eye[self.pos_h], self.val_mid - self.height / 2, self.val_mid + self.height / 2,
-                   label=f'height={self.height} V', linestyle=":", colors=['g'])
+                   label=f'height={self.height:0.3g} V', linestyle=":", colors=['g'])
         plt.xlabel('time (s)')
         plt.ylabel('amplitude (V)')
         plt.grid()
         plt.legend(loc='upper right')
+        plt.title(title)
         plt.savefig(fname)
 
 
