@@ -39,6 +39,7 @@ from bag.simulation.cache import SimulationDB, DesignInstance
 from bag.simulation.measure import MeasurementManager
 from bag.simulation.data import SimData
 from bag.concurrent.util import GatherHelper
+from bag.io.file import write_yaml
 
 from ..sp.base import SPTB
 from ..data.tran import get_first_crossings, EdgeType
@@ -54,10 +55,23 @@ class MOSSPMeas(MeasurementManager):
             helper.append(self.async_meas_pvt(name, sim_dir / sim_env, sim_db, dut, harnesses, sim_env))
 
         meas_results = await helper.gather_err()
-        results = {}
-        for idx, sim_env in enumerate(sim_envs):
-            results[sim_env] = meas_results[idx]
-        plot_results(results)
+        results = {'sim_envs': np.array(sim_envs)}
+        tbm_specs: Mapping[str, Any] = self.specs['tbm_specs']
+        mc_params = tbm_specs.get('monte_carlo_params', {})
+        for key, val in meas_results[0].items():
+            results[key] = np.zeros((len(sim_envs), *val.shape), dtype=float)
+
+        for sidx, _ in enumerate(sim_envs):
+            for key, val in meas_results[sidx].items():
+                results[key][sidx] = val
+
+        meas_type: str = self.specs['meas_type']
+        if mc_params:
+            plot_mc_results(results, sim_dir, meas_type)
+        else:
+            plot_results(results, sim_dir, meas_type)
+        results_yaml = {key: val.tolist() for key, val in results.items()}
+        write_yaml(sim_dir / 'results.yaml', results_yaml)
         return results
 
     async def async_meas_pvt(self, name: str, sim_dir: Path, sim_db: SimulationDB, dut: Optional[DesignInstance],
@@ -76,29 +90,51 @@ class MOSSPMeas(MeasurementManager):
                           dict(pin='dbias', nin='d', type='dcfeed', value=''),
                           ])
 
-        # set vgs and vds sweep info
-        vds_val = self.specs['vds_val']
-        vgs_val = self.specs['vgs_val']
+        is_mc = 'monte_carlo_params' in self.specs['tbm_specs']
+        is_nmos: bool = self.specs['is_nmos']
 
         tbm_specs = dict(
             **self.specs['tbm_specs'],
             load_list=load_list,
             sim_envs=[pvt],
-            swp_info=[('vds', dict(type='LIST', values=vds_val)),
-                      ('vgs', dict(type='LIST', values=vgs_val))],
             dut_pins=dut.pin_names,
             param_type='Y',
             ports=['PORTG', 'PORTD'],
         )
+
+        if not is_mc:
+            vgs_sweep = self.specs['vgs_sweep']
+            if is_nmos:
+                vgs_start, vgs_stop = vgs_sweep['vgs_min'], vgs_sweep['vgs_max']
+            else:
+                vgs_start, vgs_stop = -vgs_sweep['vgs_max'], -vgs_sweep['vgs_min']
+            tbm_specs['swp_info'] = [('vgs', dict(type='LINEAR', start=vgs_start, stop=vgs_stop, num=vgs_sweep['vgs_num']))]
+
         tbm = cast(SPTB, self.make_tbm(SPTB, tbm_specs))
+
+        # set vds
+        vds_val = self.specs['vds_val']
+        tbm.sim_params['vds'] = vds_val if is_nmos else -vds_val
+
+        # set vgs
+        if is_mc:
+            vgs_val = self.specs['vgs_val']
+            tbm.sim_params['vgs'] = vgs_val if is_nmos else -vgs_val
+
         sim_results = await sim_db.async_simulate_tbm_obj(name, sim_dir, dut, tbm, {'dut_conns': {'b': 's', 'd': 'd',
                                                                                                   'g': 'g', 's': 's'}},
                                                           harnesses=harnesses)
-        results = calc_ft_fmax(sim_results.data)
+        meas_type: str = self.specs['meas_type']
+        if meas_type == 'ft_fmax':
+            results = calc_ft_fmax(sim_results.data, is_mc)
+        elif meas_type == 'gm_ro':
+            results = calc_gm_ro(sim_results.data, is_mc)
+        else:
+            raise NotImplementedError(f'Unrecognized meas_type = {meas_type}')
         return results
 
 
-def calc_ft_fmax(sim_data: SimData) -> Mapping[str, Any]:
+def calc_ft_fmax(sim_data: SimData, is_mc: bool) -> Mapping[str, Any]:
     freq = sim_data['freq']
     y11 = sim_data['y11']
     y12 = sim_data['y12']
@@ -115,23 +151,97 @@ def calc_ft_fmax(sim_data: SimData) -> Mapping[str, Any]:
     ug = _num / _den
     fmax = get_first_crossings(freq, ug, 1, etype=EdgeType.FALL)
 
-    return dict(ft=ft[0], fmax=fmax[0], vgs=sim_data['vgs'], vds=sim_data['vds'])
+    ans = dict(ft=ft[0], fmax=fmax[0])
+    if not is_mc:
+        ans['vgs'] = sim_data['vgs']
+    return ans
 
 
-def plot_results(results: Mapping[str, Any]) -> None:
-    vgs = None
-    vds = None
-    fig, (ax0, ax1) = plt.subplots(1, 2)
-    ax0.set(xlabel='vgs (V)', ylabel='fT (GHz)', title='fT vs vgs')
-    ax1.set(xlabel='vgs (V)', ylabel='fmax (GHz)', title='fmax vs vgs')
-    for sim_env, _results in results.items():
-        if vgs is None:
-            vgs = _results['vgs']
-            vds = _results['vds']
-        for idx, _vds in enumerate(vds):
-            ax0.plot(vgs, _results['ft'][idx] * 1e-9, label=f'vds={_vds}, {sim_env}')
-            ax1.plot(vgs, _results['fmax'][idx] * 1e-9, label=f'vds={_vds}, {sim_env}')
+def calc_gm_ro(sim_data: SimData, is_mc: bool) -> Mapping[str, Any]:
+    # freq = sim_data['freq']   # for debug plotting
+    y21 = sim_data['y21']
+    y22 = sim_data['y22']
+
+    gm_freq = y21.real
+    ro_freq = 1 / y22.real
+
+    gm = gm_freq.mean(axis=-1)
+    ro = ro_freq.mean(axis=-1)
+
+    ans = dict(gm=gm[0], ro=ro[0])
+    if not is_mc:
+        ans['vgs'] = sim_data['vgs']
+    return ans
+
+
+def plot_results(results: Mapping[str, Any], sim_dir: Path, meas_type: str) -> None:
+    fig, (ax0, ax1) = plt.subplots(2, 1, sharex='col', figsize=(6, 8))
+    ax1.set(xlabel='vgs (V)')
+
+    if meas_type == 'ft_fmax':
+        ax0.set(ylabel='fT (GHz)')
+        ax1.set(ylabel='fmax (GHz)')
+        png_name = sim_dir / 'fT_fmax.png'
+    elif meas_type == 'gm_ro':
+        ax0.set(ylabel='gm (mS)')
+        ax1.set(ylabel='ro (Ohm)')
+        png_name = sim_dir / 'gmro.png'
+    else:
+        raise NotImplementedError(f'Unrecognized meas_type = {meas_type}')
+
+    for sidx, sim_env in enumerate(results['sim_envs']):
+        _vgs = results['vgs'][sidx]
+        if meas_type == 'ft_fmax':
+            ax0.plot(_vgs, results['ft'][sidx] * 1e-9, label=sim_env)
+            ax1.plot(_vgs, results['fmax'][sidx] * 1e-9, label=sim_env)
+        elif meas_type == 'gm_ro':
+            ax0.plot(_vgs, results['gm'][sidx] * 1e3, label=sim_env)
+            ax1.semilogy(_vgs, results['ro'][sidx], label=sim_env)
+
     ax0.legend()
+    ax0.grid()
     ax1.legend()
+    ax1.grid()
     plt.tight_layout()
-    plt.show()
+    plt.savefig(png_name)
+    plt.close()
+
+
+def plot_mc_results(results: Mapping[str, Any], sim_dir: Path, meas_type: str) -> None:
+    for sidx, sim_env in enumerate(results['sim_envs']):
+        if meas_type == 'ft_fmax':
+            fig, (ax0, ax1) = plt.subplots(2, 1, sharex='col', figsize=(6, 8))
+            _ft0 = results['ft'][sidx]
+            _ft = _ft0[~np.isinf(_ft0)]
+            _y0, _x0, _ = ax0.hist(_ft * 1e-9, color='skyblue', edgecolor='black')
+            _mean0, _std0 = _ft.mean() * 1e-9, _ft.std() * 1e-9
+            ax0.text(_mean0 + 0.5 * _std0, 0.75 * _y0.max(), f'Mean: {_mean0:.2f}\nStd: {_std0:.2f}')
+            ax0.set(xlabel='fT (GHz)', title=f'MC_{len(_ft)}')
+
+            _fmax0 = results['fmax'][sidx]
+            _fmax = _fmax0[~np.isinf(_fmax0)]
+            _y1, _x1, _ = ax1.hist(_fmax * 1e-9, color='skyblue', edgecolor='black')
+            _mean1, _std1 = _fmax.mean() * 1e-9, _fmax.std() * 1e-9
+            ax1.text(_mean1 + 0.5 * _std1, 0.75 * _y1.max(), f'Mean: {_mean1:.2f}\nStd: {_std1:.2f}')
+            ax1.set(xlabel='fmax (GHz)', title=f'MC_{len(_fmax)}')
+        elif meas_type == 'gm_ro':
+            fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(6, 8))
+            _gm0 = results['gm'][sidx]
+            _gm = _gm0[~np.isinf(_gm0)]
+            _y0, _x0, _ = ax0.hist(_gm * 1e3, color='skyblue', edgecolor='black')
+            _mean0, _std0 = _gm.mean() * 1e3, _gm.std() * 1e3
+            ax0.text(_mean0 + 0.5 * _std0, 0.75 * _y0.max(), f'Mean: {_mean0:.2f}\nStd: {_std0:.2f}')
+            ax0.set(xlabel='gm (mS)', title=f'MC_{len(_gm)}')
+
+            _ro0 = results['ro'][sidx]
+            _ro = _ro0[~np.isinf(_ro0)]
+            _y1, _x1, _ = ax1.hist(_ro * 1e-3, color='skyblue', edgecolor='black')
+            _mean1, _std1 = _ro.mean() * 1e-3, _ro.std() * 1e-3
+            ax1.text(_mean1 + 0.5 * _std1, 0.75 * _y1.max(), f'Mean: {_mean1:.2f}\nStd: {_std1:.2f}')
+            ax1.set(xlabel='ro (KOhm)', title=f'MC_{len(_ro)}')
+        else:
+            raise NotImplementedError(f'Unrecognized meas_type = {meas_type}')
+
+        plt.tight_layout()
+        plt.savefig(sim_dir / f'{sim_env}_MC.png')
+        plt.close()

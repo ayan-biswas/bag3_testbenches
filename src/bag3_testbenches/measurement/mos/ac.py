@@ -57,7 +57,7 @@ class MOSACMeas(MeasurementManager):
         results = {}
         for idx, sim_env in enumerate(sim_envs):
             results[sim_env] = meas_results[idx]
-        plot_results(results)
+        plot_results(results, sim_dir)
         return results
 
     async def async_meas_pvt(self, name: str, sim_dir: Path, sim_db: SimulationDB, dut: Optional[DesignInstance],
@@ -99,7 +99,7 @@ def calc_ft_fmax(sim_data: SimData) -> Mapping[str, Any]:
     return dict(ft=ft[0], vgs=sim_data['vgs'], vds=sim_data['vds'])
 
 
-def plot_results(results: Mapping[str, Any]) -> None:
+def plot_results(results: Mapping[str, Any], sim_dir: Path) -> None:
     vgs = None
     vds = None
     fig, (ax0) = plt.subplots(1, 1)
@@ -112,4 +112,6 @@ def plot_results(results: Mapping[str, Any]) -> None:
             ax0.plot(vgs, _results['ft'][idx] * 1e-9, label=f'vds={_vds}, {sim_env}')
     ax0.legend()
     plt.tight_layout()
-    plt.show()
+    plt.grid()
+    plt.savefig(sim_dir / 'fT.png')
+    plt.close()
