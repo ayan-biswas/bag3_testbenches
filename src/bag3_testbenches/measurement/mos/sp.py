@@ -49,6 +49,22 @@ class MOSSPMeas(MeasurementManager):
     async def async_measure_performance(self, name: str, sim_dir: Path, sim_db: SimulationDB,
                                         dut: Optional[DesignInstance],
                                         harnesses: Optional[Sequence[DesignInstance]] = None) -> Mapping[str, Any]:
+        """
+        Template meas_params for yaml file is given below.
+        meas_params:
+            sim_envs: [tt_25, ...]
+            is_nmos: True or False
+            meas_type: ft_fmax or gm_ro
+            vgs_sweep: {vgs_min: ..., vgs_max: ..., vgs_num: ...}   # for non Monte Carlo only; use positive values
+            vgs_val: ...    # for Monte Carlo only; use positive value as is_nmos will handle the sign
+            vds_val: ...    # use positive value as is_nmos will handle the sign
+            tbm_specs:
+                sweep_options: {...}    # use 10s of GHz to THz for ft_fmax; use KHz to MHz for gm_ro
+                sim_params: {...}
+                pwr_domain: {...}
+                sup_values: {...}
+                monte_carlo_params: {...}  # optional
+        """
         helper = GatherHelper()
         sim_envs = self.specs['sim_envs']
         for sim_env in sim_envs:
@@ -126,8 +142,10 @@ class MOSSPMeas(MeasurementManager):
                                                           harnesses=harnesses)
         meas_type: str = self.specs['meas_type']
         if meas_type == 'ft_fmax':
+            # frequency sweep should be in 10's of GHz to THz range to reach the zero crossing point
             results = calc_ft_fmax(sim_results.data, is_mc)
         elif meas_type == 'gm_ro':
+            # frequency sweep should be in KHz to MHz or single digit GHz range to avoid high frequency parasitics
             results = calc_gm_ro(sim_results.data, is_mc)
         else:
             raise NotImplementedError(f'Unrecognized meas_type = {meas_type}')
@@ -151,7 +169,7 @@ def calc_ft_fmax(sim_data: SimData, is_mc: bool) -> Mapping[str, Any]:
     ug = _num / _den
     fmax = get_first_crossings(freq, ug, 1, etype=EdgeType.FALL)
 
-    ans = dict(ft=ft[0], fmax=fmax[0])
+    ans = dict(ft=np.squeeze(ft), fmax=np.squeeze(fmax))
     if not is_mc:
         ans['vgs'] = sim_data['vgs']
     return ans
@@ -168,7 +186,7 @@ def calc_gm_ro(sim_data: SimData, is_mc: bool) -> Mapping[str, Any]:
     gm = gm_freq.mean(axis=-1)
     ro = ro_freq.mean(axis=-1)
 
-    ans = dict(gm=gm[0], ro=ro[0])
+    ans = dict(gm=np.squeeze(gm), ro=np.squeeze(ro))
     if not is_mc:
         ans['vgs'] = sim_data['vgs']
     return ans

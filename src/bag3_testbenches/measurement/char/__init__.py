@@ -74,6 +74,20 @@ class CharSPMeas(MeasurementManager):
     async def async_measure_performance(self, name: str, sim_dir: Path, sim_db: SimulationDB,
                                         dut: Optional[DesignInstance],
                                         harnesses: Optional[Sequence[DesignInstance]] = None) -> Mapping[str, Any]:
+        """
+        Template meas_params for yaml file is given below.
+        meas_params:
+            sim_envs: [tt_25, ...]
+            ibias_list: [...]   # optional, for diodes where the DC bias affects the cap and res values
+            tbm_specs:
+                sp_meas:
+                    sweep_options: {...}
+                    sim_params: {...}
+                    monte_carlo_params: {...}  # optional
+                dut_plus: ...   # "plus" terminal of the passive DUT
+                dut_minus: ...  # "minus" terminal of the passive DUT
+            passive_type: cap or res or ind or esd
+        """
         helper = GatherHelper()
         sim_envs = self.specs['sim_envs']
         ibias_list = self.specs.get('ibias_list', [0])
@@ -223,14 +237,21 @@ def compute_passives(meas_results: Mapping[str, Any], passive_type: str) -> Mapp
     )
     if passive_type == 'cap':
         results['cc'] = estimate_cap(freq, yc)
-        results['r_series'] = (1 / yc).mean(axis=-1).real
+        # assume yc = 1/(R + 1/jwC)
+        # Need to use higher frequencies for the resistance estimation; arbitrarily use last third only
+        # TODO: better technique: check slope, pick region where slope = 0
+        r_ser = (1 / yc).real
+        len3 = r_ser.shape[-1] // 3
+        results['r_series'] = r_ser[..., -len3:].mean(axis=-1)
     elif passive_type == 'res':
         results['c_parallel'], results['res'] = estimate_esd(freq, yc)
-        if np.mean(results['cpp']) == 0 or np.mean(results['cpm']) == 0:
+        # if parasitic caps are in aF range, then assume that those are effectively 0
+        if np.isclose(results['cpp'].min(), 0, atol=1e-18) or np.isclose(results['cpm'].min(), 0, atol=1e-18):
             cp_est = 0
         else:
             cp_est = 1 / (1 / results['cpp'] + 1 / results['cpm'])
-        if results['c_parallel'].all() > 0:
+        # if parallel cap is in aF range, then assume that it is effectively 0, so BW is infinite
+        if not np.isclose(results['c_parallel'].min(), 0, atol=1e-18):
             results['bw'] = 1 / (2 * np.pi * (results['c_parallel'] + cp_est) * results['res'])
 
         # --- Debug plots --- #
