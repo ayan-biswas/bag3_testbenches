@@ -28,19 +28,20 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Type, Union, Optional, Any, cast, Sequence, Mapping, Tuple
+from typing import Type, Optional, Any, cast, Sequence, Mapping, Tuple
 from pathlib import Path
 from shutil import copy
 import numpy as np
 import matplotlib.pyplot as plt
 
-from bag.simulation.measure import MeasurementManager, MeasInfo
+from bag.simulation.measure import MeasurementManager
 from bag.simulation.core import TestbenchManager
 from bag.simulation.data import SimNetlistInfo, netlist_info_from_dict
-from bag.simulation.cache import SimulationDB, DesignInstance, SimResults, MeasureResult
+from bag.simulation.cache import SimulationDB, DesignInstance
 from bag.design.module import Module
 from bag.concurrent.util import GatherHelper
 from bag.math import float_to_si_string
+from bag.io.file import write_yaml
 
 from ...schematic.char_tb_sp import bag3_testbenches__char_tb_sp
 
@@ -72,8 +73,21 @@ class CharSPTB(TestbenchManager):
 class CharSPMeas(MeasurementManager):
     async def async_measure_performance(self, name: str, sim_dir: Path, sim_db: SimulationDB,
                                         dut: Optional[DesignInstance],
-                                        harnesses: Optional[Sequence[DesignInstance]] = None
-                                        ) -> Mapping[int, Mapping[str, Any]]:
+                                        harnesses: Optional[Sequence[DesignInstance]] = None) -> Mapping[str, Any]:
+        """
+        Template meas_params for yaml file is given below.
+        meas_params:
+            sim_envs: [tt_25, ...]
+            ibias_list: [...]   # optional, for diodes where the DC bias affects the cap and res values
+            tbm_specs:
+                sp_meas:
+                    sweep_options: {...}
+                    sim_params: {...}
+                    monte_carlo_params: {...}  # optional
+                dut_plus: ...   # "plus" terminal of the passive DUT
+                dut_minus: ...  # "minus" terminal of the passive DUT
+            passive_type: cap or res or ind or esd
+        """
         helper = GatherHelper()
         sim_envs = self.specs['sim_envs']
         ibias_list = self.specs.get('ibias_list', [0])
@@ -83,19 +97,25 @@ class CharSPMeas(MeasurementManager):
 
         meas_results = await helper.gather_err()
         passive_type: str = self.specs['passive_type']
-        ans = {}
-        ridx = 0
-        for sim_env in sim_envs:
-            ans[sim_env] = {}
-            for idx, ibias in enumerate(ibias_list):
-                _results = meas_results[ridx]
-                _ans = compute_passives(_results, passive_type)
-                ans[sim_env][idx] = dict(
-                    **_ans,
-                    ibias=ibias,
-                )
-                ridx += 1
-        return ans
+        results = {'sim_envs': np.array(sim_envs), 'ibias': np.array(ibias_list)}
+        tbm_specs: Mapping[str, Any] = self.specs['tbm_specs']
+        mc_params = tbm_specs['sp_meas'].get('monte_carlo_params', {})
+        _ans0 = compute_passives(meas_results[0], passive_type)
+        for key, val in _ans0.items():
+            results[key] = np.zeros((len(sim_envs), len(ibias_list), *val.shape), dtype=float)
+
+        for sidx, _ in enumerate(sim_envs):
+            for iidx, _ in enumerate(ibias_list):
+                midx = sidx * len(ibias_list) + iidx
+                _ans = compute_passives(meas_results[midx], passive_type)
+                for key, val in _ans.items():
+                    results[key][sidx, iidx] = val
+
+        if mc_params:
+            plot_mc_results_hist(results, sim_dir, passive_type)
+        results_yaml = {key: val.tolist() for key, val in results.items()}
+        write_yaml(sim_dir / 'results.yaml', results_yaml)
+        return results
 
     async def async_meas_case(self, name: str, sim_dir: Path, sim_db: SimulationDB, dut: Optional[DesignInstance],
                               sim_env: str, ibias: float = 0.0) -> Mapping[str, Any]:
@@ -142,7 +162,7 @@ class CharSPMeas(MeasurementManager):
 
 def estimate_cap(freq: np.ndarray, yc: np.ndarray) -> float:
     """assume yc = jwC"""
-    fit = np.polyfit(2 * np.pi * freq, np.imag(yc), 1)
+    fit = np.polyfit(2 * np.pi * freq, yc.T.imag, 1)
     return fit[0]
 
 
@@ -150,6 +170,7 @@ def estimate_ind(freq: np.ndarray, zc: np.ndarray) -> Mapping[str, float]:
     """assume res and ind in series; cap in parallel"""
     w = 2 * np.pi * freq
 
+    # TODO: Update vector computations for Monte Carlo simulations
     # find SRF: min freq where zc.imag goes from positive to negative
     vec = (zc.imag >= 0).astype(int)
     dvec = np.diff(vec)
@@ -182,9 +203,9 @@ def estimate_ind(freq: np.ndarray, zc: np.ndarray) -> Mapping[str, float]:
 
 def estimate_esd(freq: np.ndarray, yc: np.ndarray) -> Tuple[float, float]:
     """assume yc = (1/R) + jwC; returns C, R"""
-    fit = np.polyfit(2 * np.pi * freq, np.imag(yc), 1)
+    fit = np.polyfit(2 * np.pi * freq, yc.T.imag, 1)
     cap: float = fit[0]
-    res: float = 1 / np.mean(yc.real)
+    res: float = 1 / yc.real.mean(axis=-1)
     return cap, res
 
 
@@ -216,24 +237,34 @@ def compute_passives(meas_results: Mapping[str, Any], passive_type: str) -> Mapp
     )
     if passive_type == 'cap':
         results['cc'] = estimate_cap(freq, yc)
-        results['r_series'] = np.mean(1 / yc).real
+        # assume yc = 1/(R + 1/jwC)
+        # Need to use higher frequencies for the resistance estimation; arbitrarily use last third only
+        # TODO: better technique: check slope, pick region where slope = 0
+        r_ser = (1 / yc).real
+        len3 = r_ser.shape[-1] // 3
+        results['r_series'] = r_ser[..., -len3:].mean(axis=-1)
     elif passive_type == 'res':
         results['c_parallel'], results['res'] = estimate_esd(freq, yc)
-
-        warr = 2 * np.pi * freq
-        z_meas = 1 / (yc + (ypp * ypm) / (ypp + ypm))
-        if results['cpp'] == 0 or results['cpm'] == 0:
+        # if parasitic caps are in aF range, then assume that those are effectively 0
+        if np.isclose(results['cpp'].min(), 0, atol=1e-18) or np.isclose(results['cpm'].min(), 0, atol=1e-18):
             cp_est = 0
         else:
             cp_est = 1 / (1 / results['cpp'] + 1 / results['cpm'])
-        z_est = 1 / (1 / results['res'] + 1j * warr * (results['c_parallel'] + cp_est))
-        plt.semilogx(freq, np.abs(z_meas), label='Measured')
-        plt.semilogx(freq, np.abs(z_est), label='Estimated')
-        plt.xlabel('Frequency (in Hz)')
-        plt.ylabel('Value')
-        plt.legend()
-        plt.grid()
-        plt.show()
+        # if parallel cap is in aF range, then assume that it is effectively 0, so BW is infinite
+        if not np.isclose(results['c_parallel'].min(), 0, atol=1e-18):
+            results['bw'] = 1 / (2 * np.pi * (results['c_parallel'] + cp_est) * results['res'])
+
+        # --- Debug plots --- #
+        # warr = 2 * np.pi * freq
+        # z_meas = 1 / (yc + (ypp * ypm) / (ypp + ypm))
+        # z_est = 1 / (1 / results['res'] + 1j * warr * (results['c_parallel'] + cp_est))
+        # plt.semilogx(freq, np.abs(z_meas), label='Measured')
+        # plt.semilogx(freq, np.abs(z_est), label='Estimated')
+        # plt.xlabel('Frequency (in Hz)')
+        # plt.ylabel('Value')
+        # plt.legend()
+        # plt.grid()
+        # plt.show()
     elif passive_type == 'esd':
         results['cc'], results['res'] = estimate_esd(freq, yc)
     elif passive_type == 'ind':
@@ -241,15 +272,42 @@ def compute_passives(meas_results: Mapping[str, Any], passive_type: str) -> Mapp
         ind_values = estimate_ind(freq, zc)
         results.update(ind_values)
         # --- Debug plots --- #
-        warr = 2 * np.pi * freq
-        z_est = 1 / (1 / (ind_values['res'] + 1j * warr * ind_values['ind']) + 1j * warr * ind_values['cap'])
-        plt.semilogx(freq, zc.imag, label='Measured')
-        plt.semilogx(freq, z_est.imag, label='Estimated')
-        plt.xlabel('Frequency (in Hz)')
-        plt.ylabel('Value')
-        plt.legend()
-        plt.grid()
-        plt.show()
+        # warr = 2 * np.pi * freq
+        # z_est = 1 / (1 / (ind_values['res'] + 1j * warr * ind_values['ind']) + 1j * warr * ind_values['cap'])
+        # plt.semilogx(freq, zc.imag, label='Measured')
+        # plt.semilogx(freq, z_est.imag, label='Estimated')
+        # plt.xlabel('Frequency (in Hz)')
+        # plt.ylabel('Value')
+        # plt.legend()
+        # plt.grid()
+        # plt.show()
     else:
         raise ValueError(f'Unknown passive_type={passive_type}. Use "cap" or "res" or "esd" or "ind".')
     return results
+
+
+def plot_mc_results_hist(results: Mapping[str, Any], sim_dir: Path, passive_type: str):
+    if passive_type == 'res':
+        for sidx, sim_env in enumerate(results['sim_envs']):
+            _res0 = results['res'][sidx, 0]     # assume ibias is not swept
+            _res = _res0[~np.isinf(_res0)]
+            _y, _x, _ = plt.hist(_res, color='skyblue', edgecolor='black')
+            _mean, _std = _res.mean(), _res.std()
+            plt.text(_mean + 0.5 * _std, 0.75 * _y.max(), f'Mean: {_mean:.3g}\nStd: {_std:.3g}')
+            plt.xlabel('res (Ohm)')
+            plt.title(f'MC_{len(_res)}')
+            plt.savefig(sim_dir / f'{sim_env}_MC.png')
+            plt.close()
+    elif passive_type == 'cap':
+        for sidx, sim_env in enumerate(results['sim_envs']):
+            _cap0 = results['cc'][sidx, 0]     # assume ibias is not swept
+            _cap = _cap0[~np.isinf(_cap0)]
+            _y, _x, _ = plt.hist(_cap, color='skyblue', edgecolor='black')
+            _mean, _std = _cap.mean(), _cap.std()
+            plt.text(_mean + 0.5 * _std, 0.75 * _y.max(), f'Mean: {_mean:.3g}\nStd: {_std:.3g}')
+            plt.xlabel('cc (F)')
+            plt.title(f'MC_{len(_cap)}')
+            plt.savefig(sim_dir / f'{sim_env}_MC.png')
+            plt.close()
+    else:
+        raise NotImplementedError(f'Monte Carlo histogram plot not yet implemented for passive_type = {passive_type}')
